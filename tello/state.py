@@ -1,6 +1,7 @@
 from typing import NamedTuple
 from tello.generic import RotationVector, Vector, TemperatureRange
 
+
 class TelloState(NamedTuple):
     attitude: RotationVector
     velocity: Vector[int]
@@ -17,4 +18,3 @@ class TelloState(NamedTuple):
 time of flight: {self.timeOfFlight}, height: {self.height}
 temperature: {str(self.temperature)}
 battery: {self.battery}, barometer: {self.barometer}, time: {self.time}"""
-
