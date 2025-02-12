@@ -1,4 +1,5 @@
 from typing import NamedTuple, TypeVar, Generic
+from threading import Thread, Event
 
 T = TypeVar('T')
 

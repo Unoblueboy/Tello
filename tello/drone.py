@@ -1,13 +1,36 @@
 import socket
 import threading
 import logging
+import av
+import numpy as np
+
+from queue import Queue
 
 from tello.exception import TelloException
 from tello.state import TelloState
 from tello.generic import TemperatureRange, RotationVector, Vector
 
-client_logger = logging.getLogger(f"{__name__}..client")
+# Setup logging
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+
+# Setup State Logger for State Thread
+state_handler = logging.FileHandler(f"{__name__}.state.log")        
+state_handler.setFormatter(formatter)
+
 state_logger = logging.getLogger(f"{__name__}.state")
+state_logger.addHandler(state_handler)
+
+# Setup Stream Logger for Stream Thread
+stream_handler = logging.FileHandler(f"{__name__}.stream.log")        
+stream_handler.setFormatter(formatter)
+
+stream_logger = logging.getLogger(f"{__name__}.stream")
+stream_logger.addHandler(stream_handler)
+
+# Client Logger for calls using client socket
+client_logger = logging.getLogger(f"{__name__}.client")
+
+# General Logger for everything else
 general_logger = logging.getLogger(__name__)
 
 class TelloDrone:
@@ -28,15 +51,17 @@ class TelloDrone:
         self.state_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.state_socket.bind(("0.0.0.0", 8890))
 
-        self.state_thread = threading.Thread(target=self.state_thread_function)
+        self.state_thread = threading.Thread(target=self._state_thread_function, daemon=True)
         self.state_lock = threading.Lock()
 
         # set state variable to None
         self._state = None
 
         # Setup thread for constantly receiving video stream
-        self.stream_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.stream_socket.bind(("0.0.0.0", 11111))
+        self._stream_queue = Queue(maxsize=0)
+        
+        self.stream_thread = StreamThread(("0.0.0.0", 11111), self._stream_queue)
+        self.stream_lock = threading.Lock()
 
         # Start Listening Threads
         self.state_thread.start()
@@ -51,6 +76,13 @@ class TelloDrone:
     def state(self, value: TelloState):
         with self.state_lock:
             self._state=value
+
+    @property
+    def next_frame(self):
+        """The next frame retrieved from the Tello drone"""
+        next_frame = self._stream_queue.get(block=True)
+        self._stream_queue.task_done()
+        return next_frame
 
     @property
     def speed(self):
@@ -168,26 +200,113 @@ class TelloDrone:
         """Enter SDK Mode"""
         return self._generic_client_socket_caller("command")
 
-    def takeoff(self, throw_exception = True, tries=3):
+    def takeoff(self, throw_exception = True):
         """Tello auto takeoff"""
         return self._generic_client_socket_caller(
             "takeoff",
             throw_exception=throw_exception,
-            tries=tries,
-            timeout=5.0)
+            timeout=20.0)
 
-    def land(self, throw_exception = True, tries=3):
+    def land(self, throw_exception = True):
         """Tello auto land"""
         return self._generic_client_socket_caller(
             "land",
             throw_exception=throw_exception,
-            tries=tries,
-            timeout=5.0)
+            timeout=7.0)
+    
+    def stream_on(self):
+        """Set video stream on"""
+        self._generic_client_socket_caller(f"streamon")
+        self.stream_thread.start()
 
-    def state_thread_function(self):
+    def stream_off(self):
+        """Set video stream off"""
+        self._generic_client_socket_caller(f"streamoff")
+        self.stream_thread.stop()
+
+    def emergency(self):
+        """Stop all motors immediately"""
+        return self._generic_client_socket_caller(f"emergency", timeout=20.0)
+
+    def up(self, x: int):
+        """Tello fly up with distance x cm, x: 20-500"""
+        return self._generic_client_socket_caller(f"up {x}", timeout=20.0)
+    
+    def down(self, x: int):
+        """Tello fly down with distance x cm, x: 20-500"""
+        return self._generic_client_socket_caller(f"down {x}", timeout=20.0)
+    
+    def left(self, x: int):
+        """Tello fly left with distance x cm, x: 20-500"""
+        return self._generic_client_socket_caller(f"left {x}", timeout=20.0)
+    
+    def right(self, x: int):
+        """Tello fly right with distance x cm, x: 20-500"""
+        return self._generic_client_socket_caller(f"right {x}", timeout=20.0)
+    
+    def forward(self, x: int):
+        """Tello fly forward with distance x cm, x: 20-500"""
+        return self._generic_client_socket_caller(f"forward {x}", timeout=20.0)
+    
+    def back(self, x: int):
+        """Tello fly back with distance x cm, x: 20-500"""
+        return self._generic_client_socket_caller(f"back {x}", timeout=20.0)
+    
+    def clockwise(self, x: int):
+        """Tello rotate x degrees clockwise, x: 1-3600"""
+        # set timeout to be (10 + (degrees rotated / 6)) seconds
+        return self._generic_client_socket_caller(f"cw {x}", timeout=10 + x/6)
+    
+    def counterclockwise(self, x: int):
+        """Tello rotate x degrees counterclockwise, x: 1-3600"""
+        # set timeout to be (10 + (degrees rotated / 6)) seconds
+        return self._generic_client_socket_caller(f"ccw {x}", timeout=10 + x/6)
+
+    def go(self, location: Vector[int], speed: int):
+        """Tello fly to location at speed (cm/s)
+
+        location.x, location.y, location.z: 20-500
+        speed: 10-100"""
+        return self._generic_client_socket_caller(
+            f"go {location.x} {location.y} {location.z} {speed}",
+            timeout=120)
+
+    def curve(self, location1: Vector[int], location2: Vector[int], speed: int, throw_exception=False):
+        """Tello fly a curve defined by the current and two given coordinates with speed (cm/s)
+        If the arc radius is not within the range of 0.5-10 meters, it responses false
+        
+        location1.x, location1.y, location1.z: 20-500
+        location2.x, location2.y, location2.z: 20-500
+        speed: 10-60
+        x/y/z can't be between -20 – 20 at the same time."""
+
+        return self._generic_client_socket_caller(
+            f"curve {location1.x} {location1.y} {location1.z} {location2.x} {location2.y} {location2.z} {speed}",
+            throw_exception=throw_exception)
+
+    def set_speed(self, x: int):
+        """set speed to x cm/s, x: 10-100"""
+        return self._generic_client_socket_caller(f"speed {x}")
+    
+    def rc(self, channel1: int, channel2: int, channel3: int, channel4: int):
+        """Send RC control via four channels.
+
+        channel1: left/right (-100~100)
+        channel2: forward/backward (-100~100)
+        channel3: up/down (-100~100)
+        channel4: yaw (-100~100)"""
+        return self._generic_client_socket_caller(f"rc {channel1} {channel2} {channel3} {channel4}")
+    
+    def set_wifi(self, ssid: str, password: str):
+        """Set Wi-Fi with SSID password"""
+        return self._generic_client_socket_caller(f"wifi {ssid} {password}")
+
+    def _state_thread_function(self):
+        state_logger.info("StreamThread run started")
         while True:
             try:
                 data = self.state_socket.recv(2048)
+                state_logger.debug(f"Byte data: {data}")
                 string_data = data.decode(encoding="utf-8").strip()
                 split_data = string_data.split(";")                
                 self.state = TelloState(
@@ -211,6 +330,41 @@ class TelloDrone:
                         float(split_data[13][4:]),
                         float(split_data[14][4:]),
                         float(split_data[15][4:])))
-                # print(self.state)
+                state_logger.debug(repr(self.state))
             except Exception as e:
-                print(e)
+                state_logger.exception(e)
+
+class StreamThread(threading.Thread):
+    """Thread class with a stop() method. The thread itself has to check
+    regularly for the stopped() condition."""
+
+    def __init__(self, address, queue):
+        super().__init__(daemon=True)
+        self._stop_event = threading.Event()
+        self.address = address
+        self.queue = queue
+
+    def stop(self):
+        stream_logger.info("StreamThread.stop called")
+        self._stop_event.set()
+
+    def stopped(self):
+        return self._stop_event.is_set()
+    
+    def run(self):
+        stream_logger.info("StreamThread run started")
+
+        container = av.open(f"udp://{self.address[0]}:{self.address[1]}")
+
+        for frame in container.decode(video=0):
+            if self.stopped():
+                stream_logger.info("StreamThread run stopped")
+                break
+            try:
+                stream_logger.debug(np.array(frame.to_image()))
+                self.queue.put(np.array(frame.to_image()))
+            except Exception as e:
+                stream_logger.exception(e)
+        
+        stream_logger.info("No More Frames Processed")
+        av.close()
